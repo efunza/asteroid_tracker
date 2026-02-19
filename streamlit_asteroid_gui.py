@@ -7,29 +7,33 @@
 # Run:
 #   streamlit run streamlit_asteroid_gui.py
 #
-# IMPORTANT FOR STREAMLIT CLOUD:
-# - Add a requirements.txt (example at bottom of this file).
-# - Use a headless Matplotlib backend (Agg) to avoid import/backend errors in cloud.
+# Streamlit Cloud tips:
+# - Use a headless Matplotlib backend ("Agg") for cloud.
+# - Pin versions in requirements.txt + runtime.txt (python-3.11).
 #
 # Improvements included:
-# ✅ Headless-safe matplotlib (Agg) for Streamlit Cloud
-# ✅ Consistent “Sun-fixed” physics (Sun is immovable AND not accelerated)
+# ✅ Headless-safe matplotlib backend (Agg)
+# ✅ Consistent Sun-fixed physics (Sun immovable AND not accelerated)
 # ✅ Vectorized gravity for faster physics steps
-# ✅ ML normalization (much more stable training)
+# ✅ ML normalization for asteroid AND planet positions (more stable training)
 # ✅ ML rollout uses true future planet positions (more realistic + lower error)
-# ✅ Reset model button + better caching behavior
-# ✅ Extra judge-friendly metrics (final-step error, relative % error)
+# ✅ Reset model button + safer caching behavior
+# ✅ Robust training loop: checks NaNs/Infs, stronger grad clipping, shows full traceback
+# ✅ Cloud-safe defaults: smaller batches, reduced threads
+# ✅ Extra metrics: final-step error, relative % error
 
 import time
 import math
+import traceback
 import numpy as np
 import streamlit as st
 
-# --- Headless-safe Matplotlib import (fixes common Streamlit Cloud issues) ---
+# --- Headless-safe Matplotlib import (Streamlit Cloud friendly) ---
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# --- Torch ---
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -50,13 +54,13 @@ PLANETS = [
 DIM = 2
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Normalization scales for ML stability
+# Normalization scales (keep consistent with UI bounds)
 AST_SCALE_POS = 2.5    # AU (fits slider max ~2.5)
-AST_SCALE_VEL = 10.0   # AU/yr (safe upper bound for this toy system)
+AST_SCALE_VEL = 10.0   # AU/yr (safe upper bound in this toy system)
 
 
 # -----------------------------
-# Physics helpers
+# Physics helpers (Sun-fixed, vectorized)
 # -----------------------------
 def circular_orbit_state(a_au, period_yr, phase):
     w = 2 * math.pi / period_yr
@@ -68,8 +72,8 @@ def circular_orbit_state(a_au, period_yr, phase):
 
 def accel_all_vectorized_sun_fixed(pos, masses):
     """
-    Vectorized acceleration, Sun fixed at origin with zero acceleration.
-    Consistent Sun-fixed frame for an educational demo.
+    Vectorized acceleration, consistent Sun-fixed frame.
+    Sun is pinned at origin and has zero acceleration.
     """
     # r_ij = x_j - x_i
     r = pos[None, :, :] - pos[:, None, :]         # (N,N,2)
@@ -77,12 +81,10 @@ def accel_all_vectorized_sun_fixed(pos, masses):
     inv_dist3 = 1.0 / (dist2 * np.sqrt(dist2))    # (N,N)
     np.fill_diagonal(inv_dist3, 0.0)
 
-    # Acceleration: a_i = G * sum_j m_j * r_ij / |r_ij|^3
     a_pair = G * (r * inv_dist3[..., None]) * masses[None, :, None]  # (N,N,2)
     acc = a_pair.sum(axis=1)  # (N,2)
 
-    # Sun fixed: no acceleration
-    acc[0] = 0.0
+    acc[0] = 0.0  # Sun fixed
     return acc
 
 def leapfrog_step(pos, vel, masses, dt):
@@ -92,7 +94,7 @@ def leapfrog_step(pos, vel, masses, dt):
     a1 = accel_all_vectorized_sun_fixed(pos_new, masses)
     vel_new = vel_half + 0.5 * dt * a1
 
-    # Keep Sun pinned exactly
+    # Pin Sun exactly
     pos_new[0] = 0.0
     vel_new[0] = 0.0
     return pos_new, vel_new
@@ -106,18 +108,17 @@ def simulate_system(
 ):
     rng = np.random.default_rng(seed)
 
-    names = [p[0] for p in PLANETS] + ["Asteroid"]
     masses = np.array([p[1] for p in PLANETS] + [asteroid_mass], dtype=np.float64)
-    N = len(names)
+    N = len(PLANETS) + 1  # planets + asteroid
 
     pos = np.zeros((N, DIM), dtype=np.float64)
     vel = np.zeros((N, DIM), dtype=np.float64)
 
-    # Sun fixed at origin
+    # Sun fixed
     pos[0] = np.array([0.0, 0.0])
     vel[0] = np.array([0.0, 0.0])
 
-    # Planets circular orbits with random phases
+    # Planets: circular orbits with random phases
     for i, (_, _, a, T) in enumerate(PLANETS[1:], start=1):
         phase = rng.uniform(0, 2*np.pi)
         r, v = circular_orbit_state(a, T, phase)
@@ -153,7 +154,7 @@ def simulate_system(
 
 
 # -----------------------------
-# ML Dataset (includes future planet positions)
+# ML Dataset (normalizes planets + asteroid)
 # -----------------------------
 class TrajDataset(Dataset):
     def __init__(self, planet_pos, ast_state, past_len=30, future_len=30):
@@ -165,6 +166,8 @@ class TrajDataset(Dataset):
         self.future_len = future_len
         self.Ntraj, self.steps = ast_state.shape[0], ast_state.shape[1]
         self.max_start = self.steps - (past_len + future_len)
+        if self.max_start < 0:
+            raise ValueError("Not enough steps for given past_len + future_len")
 
     def __len__(self):
         return self.Ntraj * (self.max_start + 1)
@@ -173,25 +176,27 @@ class TrajDataset(Dataset):
         traj_id = idx // (self.max_start + 1)
         s = idx % (self.max_start + 1)
 
-        past_planets = self.planet_pos[traj_id, s:s+self.past_len]  # (T,P,2)
-        fut_planets  = self.planet_pos[traj_id, s+self.past_len:s+self.past_len+self.future_len]  # (F,P,2)
+        past_planets = self.planet_pos[traj_id, s:s+self.past_len].astype(np.float32)  # (T,P,2)
+        fut_planets  = self.planet_pos[traj_id, s+self.past_len:s+self.past_len+self.future_len].astype(np.float32)
 
-        past_ast = self.ast_state[traj_id, s:s+self.past_len]  # (T,4)
-        fut_ast  = self.ast_state[traj_id, s+self.past_len:s+self.past_len+self.future_len]  # (F,4)
+        past_ast = self.ast_state[traj_id, s:s+self.past_len].astype(np.float32)  # (T,4)
+        fut_ast  = self.ast_state[traj_id, s+self.past_len:s+self.past_len+self.future_len].astype(np.float32)
 
-        # Normalize asteroid states for stability
-        past_ast_n = past_ast.astype(np.float32).copy()
-        fut_ast_n  = fut_ast.astype(np.float32).copy()
-        past_ast_n[:, 0:2] /= AST_SCALE_POS
-        past_ast_n[:, 2:4] /= AST_SCALE_VEL
-        fut_ast_n[:, 0:2]  /= AST_SCALE_POS
-        fut_ast_n[:, 2:4]  /= AST_SCALE_VEL
+        # Normalize planets (positions in AU)
+        past_planets /= AST_SCALE_POS
+        fut_planets  /= AST_SCALE_POS
+
+        # Normalize asteroid state
+        past_ast[:, 0:2] /= AST_SCALE_POS
+        past_ast[:, 2:4] /= AST_SCALE_VEL
+        fut_ast[:, 0:2]  /= AST_SCALE_POS
+        fut_ast[:, 2:4]  /= AST_SCALE_VEL
 
         return (
             torch.tensor(past_planets, dtype=torch.float32),
-            torch.tensor(past_ast_n, dtype=torch.float32),
+            torch.tensor(past_ast, dtype=torch.float32),
             torch.tensor(fut_planets, dtype=torch.float32),
-            torch.tensor(fut_ast_n, dtype=torch.float32),
+            torch.tensor(fut_ast, dtype=torch.float32),
         )
 
 
@@ -240,10 +245,11 @@ class AsteroidSurrogate(nn.Module):
 
     def forward(self, past_planets_xy, past_ast_state, future_planets_xy=None, future_len=30):
         """
+        Inputs are normalized.
         past_planets_xy: (B,T,P,2)
-        past_ast_state : (B,T,4)   [normalized]
+        past_ast_state : (B,T,4)
         future_planets_xy: (B,F,P,2) or None
-        returns: (B,F,4) [normalized]
+        Returns normalized predicted asteroid states: (B,F,4)
         """
         B, T, P, _ = past_planets_xy.shape
 
@@ -279,11 +285,13 @@ class AsteroidSurrogate(nn.Module):
 
 
 # -----------------------------
-# Training helpers (cached)
+# Training helpers
 # -----------------------------
 @st.cache_resource
 def make_model():
-    return AsteroidSurrogate(gnn_hidden=64, lstm_hidden=128).to(DEVICE)
+    # Cloud-safe: CPU only is common; CUDA if available
+    model = AsteroidSurrogate(gnn_hidden=64, lstm_hidden=128).to(DEVICE)
+    return model
 
 def train_quick(model, planet_pos, ast_state, past_len, future_len, epochs, batch_size, lr):
     ds = TrajDataset(planet_pos, ast_state, past_len=past_len, future_len=future_len)
@@ -294,25 +302,48 @@ def train_quick(model, planet_pos, ast_state, past_len, future_len, epochs, batc
 
     model.train()
     history = []
+
+    # Cloud CPUs can be cranky with many threads
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+
     for ep in range(1, epochs + 1):
         running, n = 0.0, 0
         t0 = time.time()
-        for past_planets, past_ast, fut_planets, fut_ast in dl:
-            past_planets = past_planets.to(DEVICE)
-            past_ast = past_ast.to(DEVICE)
-            fut_planets = fut_planets.to(DEVICE)
-            fut_ast = fut_ast.to(DEVICE)
 
-            pred = model(past_planets, past_ast, future_planets_xy=fut_planets, future_len=future_len)
-            loss = loss_fn(pred, fut_ast)
+        for step, (past_planets, past_ast, fut_planets, fut_ast) in enumerate(dl, start=1):
+            try:
+                past_planets = past_planets.to(DEVICE)
+                past_ast = past_ast.to(DEVICE)
+                fut_planets = fut_planets.to(DEVICE)
+                fut_ast = fut_ast.to(DEVICE)
 
-            opt.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+                pred = model(past_planets, past_ast, future_planets_xy=fut_planets, future_len=future_len)
+                loss = loss_fn(pred, fut_ast)
 
-            running += float(loss.item()) * past_planets.size(0)
-            n += past_planets.size(0)
+                # If loss is NaN/Inf, skip this batch
+                if not torch.isfinite(loss):
+                    st.warning(f"Skipping batch {step}: non-finite loss ({float(loss.detach().cpu()):.6g})")
+                    opt.zero_grad(set_to_none=True)
+                    continue
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+
+                # Stronger clipping helps prevent backward explosions
+                nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+
+                opt.step()
+
+                running += float(loss.item()) * past_planets.size(0)
+                n += past_planets.size(0)
+
+            except RuntimeError:
+                st.error("Training crashed (likely during backward). Full traceback:")
+                st.code(traceback.format_exc())
+                raise
 
         ep_loss = running / max(1, n)
         history.append(ep_loss)
@@ -355,7 +386,6 @@ with colA:
     tdir = np.array([-r0[1], r0[0]]) / r
     rdir = r0 / r
     v0 = (speed_factor * v_circ) * tdir + (radial_push * v_circ) * rdir
-
     asteroid_init = {"r0": r0, "v0": v0}
 
     st.write("Asteroid initial state (AU, AU/yr):")
@@ -365,6 +395,7 @@ with colB:
     st.subheader("2) Train ML Surrogate (optional but recommended)")
     st.write("Generate synthetic trajectories, then train a model to imitate the physics simulator.")
 
+    # Cloud-safe defaults
     n_traj = st.slider("Number of synthetic trajectories", 50, 800, 200, 50)
     train_steps = st.slider("Steps per training trajectory", 200, 1200, min(600, steps), 50)
 
@@ -372,7 +403,7 @@ with colB:
     future_len = st.slider("Predict ahead (timesteps)", 10, 120, 60, 5)
 
     epochs = st.slider("Training epochs", 1, 30, 6, 1)
-    batch_size = st.selectbox("Batch size", [32, 64, 128, 256], index=2)
+    batch_size = st.selectbox("Batch size (Cloud-safe: 32 or 64)", [32, 64, 128, 256], index=0)
     lr = st.selectbox("Learning rate", [1e-3, 2e-3, 5e-4], index=1)
 
     if "train_data" not in st.session_state:
@@ -380,13 +411,10 @@ with colB:
     if "trained" not in st.session_state:
         st.session_state.trained = False
 
-    # Reset model weights cleanly
     if st.button("Reset Model Weights"):
         st.cache_resource.clear()
         st.session_state.trained = False
         st.success("Model reset. You can retrain now.")
-
-    model = make_model()
 
     if st.button("Generate Training Data"):
         with st.spinner("Generating trajectories..."):
@@ -405,7 +433,6 @@ with colB:
             st.session_state.trained = False
             st.success(f"Done! Generated {n_traj} trajectories in {time.time()-t0:.2f}s")
 
-    # Re-fetch model after potential reset
     model = make_model()
 
     if st.button("Train / Retrain Model"):
@@ -421,7 +448,7 @@ with colB:
                     past_len=past_len,
                     future_len=future_len,
                     epochs=epochs,
-                    batch_size=batch_size,
+                    batch_size=int(batch_size),
                     lr=float(lr),
                 )
                 st.session_state.trained = True
@@ -459,22 +486,30 @@ if run_demo:
         st.stop()
 
     s = steps - (past_len + future_len)
-    past_plan = planet_pos_true[s:s+past_len]                         # (T,P,2)
-    past_ast = ast_true[s:s+past_len]                                 # (T,4)
-    true_future = ast_true[s+past_len:s+past_len+future_len]          # (F,4)
-    future_plan = planet_pos_true[s+past_len:s+past_len+future_len]   # (F,P,2)
 
-    past_ast_n = past_ast.astype(np.float32).copy()
+    past_plan = planet_pos_true[s:s+past_len].astype(np.float32)                 # (T,P,2)
+    future_plan = planet_pos_true[s+past_len:s+past_len+future_len].astype(np.float32)  # (F,P,2)
+
+    past_ast = ast_true[s:s+past_len].astype(np.float32)                         # (T,4)
+    true_future = ast_true[s+past_len:s+past_len+future_len].astype(np.float32)  # (F,4)
+
+    # Normalize inputs for model
+    past_plan_n = past_plan / AST_SCALE_POS
+    future_plan_n = future_plan / AST_SCALE_POS
+
+    past_ast_n = past_ast.copy()
     past_ast_n[:, 0:2] /= AST_SCALE_POS
     past_ast_n[:, 2:4] /= AST_SCALE_VEL
 
     if not st.session_state.get("trained", False):
         st.warning("Model is not trained yet. The ML prediction may be poor. Train it first for better results.")
 
+    model = make_model()
     model.eval()
-    x_plan = torch.tensor(past_plan, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+
+    x_plan = torch.tensor(past_plan_n, dtype=torch.float32).unsqueeze(0).to(DEVICE)
     x_ast = torch.tensor(past_ast_n, dtype=torch.float32).unsqueeze(0).to(DEVICE)
-    x_future_plan = torch.tensor(future_plan, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+    x_future_plan = torch.tensor(future_plan_n, dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
     with st.spinner("Running ML surrogate prediction..."):
         t0 = time.time()
@@ -486,10 +521,12 @@ if run_demo:
             ).cpu().numpy()[0]
         t_ml = time.time() - t0
 
+    # Unnormalize predictions back to AU and AU/yr
     pred_future = pred_future_n.copy()
     pred_future[:, 0:2] *= AST_SCALE_POS
     pred_future[:, 2:4] *= AST_SCALE_VEL
 
+    # Metrics
     err_au = np.linalg.norm(pred_future[:, 0:2] - true_future[:, 0:2], axis=1)
     err = err_au * (AU_TO_KM if show_error_km else 1.0)
     unit = "km" if show_error_km else "AU"
@@ -502,6 +539,7 @@ if run_demo:
     denom = r_mean_au * (AU_TO_KM if show_error_km else 1.0)
     rel_mean_pct = (mean_err / denom) * 100.0 if denom > 0 else float("nan")
 
+    # Plots
     left, right = st.columns([1.2, 1.0])
 
     with left:
@@ -536,7 +574,6 @@ if run_demo:
         st.write(f"**Max position error:** {max_err:,.2f} {unit}")
         st.write(f"**Final-step error:** {final_err:,.2f} {unit}")
         st.write(f"**Mean error as % of distance from Sun:** {rel_mean_pct:.2f}%")
-
         st.write(f"**Physics runtime:** {t_phys:.4f} s")
         st.write(f"**ML runtime:** {t_ml:.4f} s")
         if t_ml > 0:
@@ -549,15 +586,19 @@ st.markdown(
 ### Science fair talking points (short)
 - **Physics baseline:** I simulate gravity using an N-body numerical integrator (Leapfrog).
 - **ML surrogate:** A **Graph Neural Network** summarizes gravitational “influences” from planets, and an **LSTM** predicts how the asteroid state changes over time.
-- **Big upgrade:** During the prediction window, the ML model can use the **planet positions over time**, not frozen planets, which improves realism and reduces error.
+- **Big upgrade:** The ML model can use **planet positions over time** during the prediction window (not frozen planets), improving realism and reducing error.
 - **Why it matters:** ML can screen many asteroids quickly, then the most risky ones can be re-checked with high-precision physics.
 """
 )
 
 # -----------------------------
-# Streamlit Cloud requirements.txt (create this file in your repo)
+# Streamlit Cloud files (create in repo)
 # -----------------------------
-# streamlit>=1.30
-# numpy>=1.24
-# matplotlib>=3.7
-# torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu
+# requirements.txt (recommended):
+# streamlit==1.32.2
+# numpy==1.26.4
+# matplotlib==3.8.4
+# torch==2.2.2
+#
+# runtime.txt:
+# python-3.11
